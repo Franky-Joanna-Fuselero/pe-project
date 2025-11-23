@@ -12,6 +12,7 @@ use App\Services\ExamTakingService;
 use App\Services\UserService;
 use App\Http\Controllers\Controller;
 use Carbon\Carbon;
+use App\Events\StudentEnrolled;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Http\Request;
 use Str;
@@ -28,15 +29,25 @@ class ExamController extends Controller
         $this->examService = $examService;
         $this->examTakingService = $examTakingService;
     }
-
+    public function index(){
+        return redirect()->route('students.index');
+    }
     public function show(Exam $exam){
         return view( 'students/exams/show', ['exam'=> $exam]);
     }
     
     public function showExamOverview(Exam $exam)
     {
-        $exam->load('course');
-        return view('students/exams/get-exam-overview', ['exam' => $exam]);
+        $user = auth()->user();
+        $student_attempts_left = $this->examTakingService->getAttemptsLeft($exam, $user);
+        $student_paper = $this->examTakingService->checkBooleanUnsubmittedExamPaper($exam, $user);
+
+        $data = [
+            'exam' => $exam, 
+            'attempts_left' => $student_attempts_left,
+            'has_unsubmitted_paper' => $student_paper
+        ];
+        return view('students/exams/get-exam-overview', $data);
     }
     public function store(){
         $user = auth()->user();
@@ -57,6 +68,12 @@ class ExamController extends Controller
             'errors' => ['access-code' => ['Already enrolled in this Exam.']],
             'old' => ['access-code' => request()->input('access-code')]
             ]);
+        }
+
+        // dispatch enrollment event so listeners can create notifications, etc.
+        $exam = $exam_access_code->exam ?? null;
+        if ($exam) {
+            event(new StudentEnrolled($user, $exam));
         }
 
         return response('', 200)->header('HX-Refresh', 'true');

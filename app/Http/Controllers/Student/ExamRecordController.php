@@ -2,19 +2,30 @@
 
 namespace App\Http\Controllers\Student;
 
+use App\Models\CodingAnswer;
 use App\Models\Exam;
 use App\Models\ExamRecord;
+use App\Models\Reviewer;
 use App\Models\StudentAnswer;
 use App\Models\StudentPaper;
 use App\Services\ExamTakingService;
 use App\Services\QuestionService;
+use Carbon\Carbon;
 use DB;
 use Illuminate\Http\Request;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Redis;
+use Storage;
 use Str;
 
 class ExamRecordController extends Controller
 {
+    protected $examTakingService;
+
+    public function __construct(ExamTakingService $examTakingService)
+    {
+        $this->examTakingService = $examTakingService;
+    }
     public function index(Exam $exam)
     {
         $user = auth()->user();
@@ -29,64 +40,9 @@ class ExamRecordController extends Controller
 
     public function store(StudentPaper $student_paper)
     {
-        // validate that the student_paper's author is the authenticated user
-        $student_paper->update(['submitted_at' => now()]);
-
-        $exam_id = $student_paper->exam->id;
-        $exam = Exam::find($exam_id);
-
-        $attempt_count = session()->pull('current_attempt', 1);
-
-        $subject_table = DB::table('student_answers')
-        ->join('questions', 'student_answers.question_id', '=', 'questions.id')
-        ->join('topics', 'questions.topic_id', '=', 'topics.id')
-        ->join('subjects', 'topics.subject_id', '=', 'subjects.id')
-        ->where('student_answers.student_paper_id', $student_paper->id)
-        ->groupBy('subjects.id', 'subjects.name')
-        ->select(
-            'subjects.id as id',    
-            'subjects.name as subject_name',
-            DB::raw('SUM(student_answers.points) as subject_score_obtained'),
-            DB::raw('SUM(questions.total_points) as subject_score'))
-        ->get()
-        ->keyBy('id');
-
-        $total_score = $subject_table->sum('subject_score_obtained');
-        $date_taken = $student_paper->created_at;
-        
-        $time_taken = round($student_paper->created_at->diffInMinutes($student_paper->submitted_at));
-
-        $exam_record = $student_paper->examRecord()->updateOrCreate(
-        ['student_paper_id' => $student_paper->id],
-            [
-                    'attempt' => $attempt_count,
-                    'total_score' => $total_score,
-                    'date_taken' => $date_taken,
-                    'time_taken' => $time_taken,
-            ]);
-
-        $transformed_subject_table = $subject_table->map(function ($item) use ($exam_record) {
-            return [
-                'exam_record_id'   => $exam_record->id,
-                'subject_id'       => $item->id,
-                'subject_name'     => $item->subject_name,
-                'score_obtained'   => (int) $item->subject_score_obtained,
-                'score'            => (int) $item->subject_score,
-                'created_at'       => now(),
-                'updated_at'       => now(),
-            ];
-        })->values()->toArray();
-
-        DB::table('exam_records_subjects')->upsert(
-        $transformed_subject_table,
-        ['exam_record_id', 'subject_id'],
-        ['score_obtained', 'score', 'updated_at']
-        );
-
-        $student_paper->update(['status'  => 'completed']);
-        
-
-        return response('', 204)->header('HX-Redirect', route('exam_records.show', ['exam' => $exam, 'exam_record' => $exam_record]));
+        $user = auth()->user();
+        $exam_result = $this->examTakingService->submitPaper($student_paper, $user);
+        return response('', 204)->header('HX-Redirect', route('exam_records.show', ['exam' => $exam_result['exam'], 'exam_record' => $exam_result['exam_record']]));
     }
 
     public function show(Exam $exam, ExamRecord $examRecord)
@@ -139,17 +95,7 @@ class ExamRecordController extends Controller
                                 : 'N/A';
                             break;
                         case 'coding':
-                            $yourAnswer = $question_type_answer;
-
-                            if ($answer->codingAnswer) {
-                                $points = $answer->codingAnswer->only([
-                                    'answer_syntax_points',
-                                    'answer_runtime_points',
-                                    'answer_test_case_points'
-                                ]);
-
-                                $yourAnswer = array_merge($yourAnswer, $points);
-                            }
+                            $yourAnswer = $answer->codingAnswer;
                             break;
                         default:
                             $yourAnswer = 'Unsupported';
@@ -166,18 +112,131 @@ class ExamRecordController extends Controller
                 'score' => $answer->points ?? 0,
                 'max_score' => $question->total_points,
                 'status' => ($answer->gained_points >= $question->points) ? 'Correct' : 'Incorrect',
-                'question_type_answer' => $question_type_answer ?? null,
+                'question_type_answer' => $question_type_answer ?? null
             ];
         }
+
+        // Get subject-topic pairs from exam questions
+        $examQuestions = $exam->questions()->with('topic.subject')->get();
+
+        $topics = [];
+
+        foreach ($examQuestions as $question) {
+            if (!in_array($question->topic_id, $topics)) {
+                $topics[] = $question->topic_id;
+            }
+        }
+
+        $reviewers = DB::select('
+            SELECT reviewers.*, subjects.name as subject_name, topics.name AS topic_name
+            FROM reviewers
+            INNER JOIN topics ON topics.id = reviewers.topic
+            INNER JOIN subjects ON subjects.id = topics.subject_id
+            WHERE reviewers.topic IN ('.implode(',', array_fill(0, count($topics), '?')).')
+        ', $topics);
 
 
         $data = [
             'exam_record' => $examRecord,
             'student_paper' => $student_paper,
             'exam' => $exam,
-            'rows' => $rows
+            'rows' => $rows,
+            'reviewers' => $reviewers
         ];
 
         return view('students/records/show', $data);
+    }
+
+    public function showCodingResult(CodingAnswer $codingAnswer){
+        $coding_answer_status = Redis::hget('checked_code', $codingAnswer->id);
+        $data['status'] = $coding_answer_status;    
+        if ($coding_answer_status == 'checked'){
+            $data['code_answer'] = $codingAnswer;
+            $data['success'] = $codingAnswer->is_code_success;
+            $data['test_results'] = json_decode($codingAnswer->test_results);
+            $data['failures'] = json_decode($codingAnswer->failures);
+            $data['syntax_points'] = $codingAnswer->answer_syntax_points;
+            $data['runtime_points'] = $codingAnswer->answer_runtime_points;
+            $data['test_case_points'] = $codingAnswer->answer_test_case_points;
+            $data['number'] = request()->input('number');
+            $data['question'] = request()->input('question');
+            $data['score'] = $codingAnswer->answer_syntax_points + $codingAnswer->answer_runtime_points + $codingAnswer->answer_test_case_points;
+            $data['max_score'] = request()->input('max_score');
+
+            return view('students/records/get-coding-result', ['data' => $data]);
+        } else {
+            return response('', 212);
+        }
+    }
+
+    public function showUpdatedScore(ExamRecord $examRecord){
+        if ($examRecord->status != 'in_progress'){
+            $student_paper = StudentPaper::findOrFail($examRecord->student_paper_id);
+            $examRecord->load('subjects');
+        
+            $examRecord['max_score'] = request()->input('max_score');
+
+            $student_paper->update(['status'  => 'completed']);
+
+            return view('students/records/get-updated-score', ['exam_record' => $examRecord]);
+        } else {
+            return response('', 212);
+        }
+    }
+
+    private static function storeCodeToJSON($user_id, $student_paper_id){
+        $pattern = "user:$user_id:paper:$student_paper_id:language:*:answer:*:code";
+        // $student_paper_date = StudentPaper::find($student_paper_id)->submitted_at;
+        // $student_paper_submitted_at_unix = (String) Carbon::parse($student_paper_date)->timestamp;
+        // $key = $student_paper_submitted_at_unix . '-' . $user_id;
+
+        $keys = Redis::keys($pattern); 
+        // $values = Redis::mget($keys);
+        $data = [];
+
+        foreach ($keys as $index => $key) {
+            try {
+                $hashData = Redis::hgetall($key);
+
+                preg_match('/paper:([^:]+)/', $key, $student_paper_matches);
+                $student_paper_id = (int)$student_paper_matches[1] ?? null;
+
+                preg_match('/language:([^:]+)/', $key, $language_matches);
+                $language = $language_matches[1] ?? null;
+
+                preg_match('/answer:(\d+)/', $key, $answer_matches);
+                $answer_id = isset($answer_matches[1]) ? (int)$answer_matches[1] : null;
+
+                preg_match('/coding_answer:(\d+)/', $key, $coding_answer_matches);
+                $coding_answer_id = isset($coding_answer_matches[1]) ? (int)$coding_answer_matches[1] : null;
+
+
+                $data[] = [
+                    'student_paper_id' => $student_paper_id,
+                    'answer_id' => $answer_id,
+                    'coding_answer_id'     => $coding_answer_id,
+                    'language'      => $language,
+                    'data'          => $hashData,
+                ];
+                
+                Redis::del($key);
+            } catch (\Exception $e) {
+                // log the error
+                continue;
+            }
+        }
+
+        $json_pretty_print = json_encode($data, JSON_PRETTY_PRINT);
+        $json = json_encode($data);
+
+        $folder = "codeInJSON/";
+
+        $answer_file_path = "{$folder}user_{$user_id}:paper_{$student_paper_id}.json";
+
+        Storage::makeDirectory($folder);
+        Storage::put($answer_file_path, $json_pretty_print);
+        
+        Redis::XADD("code_checker", '*', ["data" => $json]);
+
     }
 }

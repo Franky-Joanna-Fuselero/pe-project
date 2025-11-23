@@ -1,14 +1,10 @@
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
-import { defaultKeymap } from "@codemirror/commands";
 import { basicSetup } from "codemirror";
 import {python} from "@codemirror/lang-python"
 import { java } from "@codemirror/lang-java";
 import {cpp} from "@codemirror/lang-cpp"
-import {markdown} from "@codemirror/lang-markdown"
-import { lineNumbers } from "@codemirror/view"
-import { history, historyKeymap } from '@codemirror/commands';
-import { placeholder } from "@codemirror/view";
+import {indentWithTab} from "@codemirror/commands"
 
     // Initialize Constant Variables
     const supported_languages = {};
@@ -24,7 +20,6 @@ import { placeholder } from "@codemirror/view";
 
     function switchLanguage(language) {
         currentLanguage = language;
-        console.log(currentLanguage, language);
         if (!initial_solution_editor || !test_case_editor) return;
 
         let extension;
@@ -67,7 +62,24 @@ import { placeholder } from "@codemirror/view";
 
             const initial_solution_state = EditorState.create({
                 doc: values.initial_solution || "",
-                extensions: [basicSetup, extension]
+                extensions: [
+                    basicSetup, 
+                    keymap.of([indentWithTab]), 
+                    EditorView.domEventHandlers({
+                        paste: (event, view) => {
+                            event.preventDefault();
+                            return true;
+                        },
+                        copy: (event, view) => {
+                            event.preventDefault(); 
+                            return true;
+                        },
+                        cut: (event, view) => {
+                            event.preventDefault(); 
+                            return true;
+                        },
+                    }),
+                    extension]
             });
             const test_case_state = EditorState.create({
                 doc: values.test_case || "",
@@ -102,7 +114,6 @@ import { placeholder } from "@codemirror/view";
         const initial_solution_div = document.getElementById("initial-solution-div");
         const test_case_div = document.getElementById("test-case-div");
         const select_form = document.getElementById("answer[programming_language]");
-        console.log('run initialize editors');
         if (!initial_solution_div || !test_case_div || !select_form) {
             console.warn("Editor elements not found. Skipping initialization.");
             return;
@@ -126,7 +137,6 @@ import { placeholder } from "@codemirror/view";
 
         const select = document.getElementById('answer[programming_language]');
         if (!select || select.dataset.initialized === "true") return;
-        console.log('this is window.question_supported_languages', window.question_supported_languages)
         loadSupportedLanguages(window.question_supported_languages);
 
         switchLanguageFromEvent({ target: { value: select.value } });
@@ -142,15 +152,19 @@ import { placeholder } from "@codemirror/view";
         }
     }
 
+    function testStudentCode(){
+        const select_form = document.getElementById('answer[programming_language]');
+        document.getElementById('student-code-test-input').value = initial_solution_editor.state.doc.toString();
+        document.getElementById('language-to-validate-input').value = select_form.value;
+        return true;
+    }
+
     document.body.addEventListener("htmx:configRequest", function (e) {
-        console.log('htmx:configRequest is run');
         const container = e.detail.target.querySelector("#coding-question");
         if (!container) return;
         try {
             const editor = initial_solution_editor;
             const textarea = document.getElementById("answer-input");
-            console.log(editor.state.doc.toString());
-
 
             if (editor && textarea) {
                 textarea.value = editor.state.doc.toString();
@@ -164,7 +178,6 @@ import { placeholder } from "@codemirror/view";
     });
 
     document.body.addEventListener("htmx:afterSwap", function (e) {
-        console.log('htmx:afterSwap is run');
         const container = e.detail.elt.querySelector("#coding-question");
         if (!container) return;
 
@@ -172,7 +185,6 @@ import { placeholder } from "@codemirror/view";
 
             const instruction = JSON.parse(container.dataset.instruction || '{}');
             const languageCodes = JSON.parse(container.dataset.languageCodes || '{}');
-            console.log('This are the coding question type data',instruction, languageCodes);
             window.instruction = instruction;
             window.question_supported_languages = languageCodes;
 
@@ -182,7 +194,40 @@ import { placeholder } from "@codemirror/view";
             console.error("[HTMX] Failed to parse editor data:", e);
         }
     });
+    document.addEventListener('htmx:beforeRequest', function () {
+        const btn = document.getElementById('test-code-button');
+        if (btn) btn.disabled = true;
+    });
+
+    document.body.addEventListener('htmx:configRequest', function(evt) {
+        document.querySelectorAll('.question-button').forEach(b => {
+            b.disabled = true;
+            b.classList.add('opacity-50', 'pointer-events-none');
+        });
+    });
+
+    document.addEventListener('htmx:afterRequest', function (evt) {
+        const btn = document.getElementById('test-code-button');
+        if (btn) btn.disabled = false;
+
+        const clickedBtn = evt.detail.elt;
+
+        // Enable and reset all buttons first
+        document.querySelectorAll('.question-button').forEach(b => {
+            b.disabled = false;
+            b.classList.remove('text-blue-900', 'font-bold', 'pointer-events-none', 'opacity-50');
+        });
+
+        // Then disable and style the clicked button only
+        if (clickedBtn && clickedBtn.classList.contains('question-button')) {
+            clickedBtn.classList.add('text-blue-900', 'font-bold', 'pointer-events-none');
+            clickedBtn.disabled = true;
+        }
+    });
+
 
 window.initializeCodingQuestionPage = initializeCodingQuestionPage;
 window.initializeEditors = initializeEditors; 
 window.syncCodeMirrorToTextarea = syncCodeMirrorToTextarea;
+window.testStudentCode = testStudentCode;
+
